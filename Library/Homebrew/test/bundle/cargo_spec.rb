@@ -4,6 +4,7 @@
 require "bundle"
 require "bundle/dsl"
 require "bundle/shared_examples/inventory"
+require "bundle/shared_examples/upgradable_extension"
 require "bundle/extensions/cargo"
 
 RSpec.describe Homebrew::Bundle::Cargo do
@@ -29,6 +30,133 @@ RSpec.describe Homebrew::Bundle::Cargo do
   def stub_cargo_list(output)
     allow(described_class).to receive(:command_output)
       .with(Pathname("cargo"), args: ["install", "--list"], print_stderr: true).and_return(output)
+  end
+
+  describe ".package_outdated?" do
+    before do
+      described_class.reset!
+      allow(described_class).to receive(:package_manager_executable).and_return(Pathname("cargo"))
+      stub_cargo_list("example-tool v1.0.0:\n    example-tool\n")
+      allow(SystemCommand).to receive(:run!)
+        .with(Pathname("cargo"), args: ["info", "--color=never", "example-tool"],
+                                 chdir: HOMEBREW_TEMP, print_stderr: false)
+        .and_return(instance_double(SystemCommand::Result, stdout: "example-tool\nversion: 1.1.0\n"))
+    end
+
+    it "compares the installed and registry versions" do
+      expect(described_class.package_outdated?("example-tool")).to be(true)
+    end
+
+    test_each([false, true]) do |exit_on_first_error|
+      it "reports a failed registry lookup with exit_on_first_error=#{exit_on_first_error}" do
+        allow(SystemCommand).to receive(:run!)
+          .with(Pathname("cargo"), args: ["info", "--color=never", "example-tool"],
+                                   chdir: HOMEBREW_TEMP, print_stderr: false)
+          .and_raise(ErrorDuringExecution.new(["cargo", "info", "example-tool"], status: 1, output: []))
+
+        expect(described_class.check([described_class.entry("example-tool")], exit_on_first_error:))
+          .to eq(["Cargo Package example-tool needs to be upgraded."])
+      end
+
+      it "reports a failed Git lookup with exit_on_first_error=#{exit_on_first_error}" do
+        stub_cargo_list("example-tool v1.0.0 (https://example.com/tool?branch=next#12345678):\n")
+        allow(described_class).to receive(:command_output)
+          .with("git", args: ["ls-remote", "--exit-code", "https://example.com/tool", "refs/heads/next"])
+          .and_raise(ErrorDuringExecution.new(["git", "ls-remote"], status: 2, output: []))
+
+        expect(described_class.check(
+                 [described_class.entry("example-tool",
+                                        source: "https://example.com/tool?branch=next")], exit_on_first_error:
+               )).to eq(["Cargo Package example-tool needs to be upgraded."])
+      end
+    end
+
+    it "does not query the registry for a crate installed from a local path" do
+      stub_cargo_list("example-tool v1.0.0 (/tmp/example-tool):\n    example-tool\n")
+      expect(SystemCommand).not_to receive(:run!)
+      described_class.package_outdated?("example-tool")
+    end
+
+    it "does not replace a local crate with a newer registry crate" do
+      stub_cargo_list("example-tool v1.0.0 (/tmp/example-tool):\n    example-tool\n")
+      expect(described_class.preinstall!("example-tool")).to be(false)
+    end
+
+    it "does not downgrade a newer installed version" do
+      stub_cargo_list("example-tool v1.2.0:\n    example-tool\n")
+      expect(described_class.package_outdated?("example-tool")).to be(false)
+    end
+
+    it "uses the latest version when cargo info finds a workspace dependency" do
+      allow(SystemCommand).to receive(:run!)
+        .with(Pathname("cargo"), args: ["info", "--color=never", "example-tool"],
+                                 chdir: HOMEBREW_TEMP, print_stderr: false)
+        .and_return(instance_double(SystemCommand::Result, stdout: "example-tool\nversion: 1.0.0 (latest 1.1.0)\n"))
+      expect(described_class.package_outdated?("example-tool")).to be(true)
+    end
+
+    it "rejects invalid registry version output" do
+      allow(SystemCommand).to receive(:run!)
+        .with(Pathname("cargo"), args: ["info", "--color=never", "example-tool"],
+                                 chdir: HOMEBREW_TEMP, print_stderr: false)
+        .and_return(instance_double(SystemCommand::Result, stdout: ""))
+      expect { described_class.package_outdated?("example-tool") }
+        .to raise_error(RuntimeError, /Invalid Cargo version/)
+    end
+
+    it "checks Git branches even when the crate version is unchanged" do
+      stub_cargo_list("example-tool v1.0.0 (https://example.com/tool?branch=next#12345678):\n")
+      allow(described_class).to receive(:command_output)
+        .with("git", args: ["ls-remote", "--exit-code", "https://example.com/tool", "refs/heads/next"])
+        .and_return("abcdef1234567890\trefs/heads/next\n")
+      expect(described_class.package_outdated?("example-tool", source: "https://example.com/tool?branch=next"))
+        .to be(true)
+    end
+
+    it "checks symbolic Git revisions" do
+      stub_cargo_list("example-tool v1.0.0 (https://example.com/tool?rev=next#12345678):\n")
+      allow(described_class).to receive(:command_output)
+        .with("git", args: ["ls-remote", "--exit-code", "https://example.com/tool",
+                            "next", "refs/heads/next", "refs/tags/next", "refs/tags/next^{}"])
+        .and_return("abcdef1234567890\trefs/heads/next\n")
+      expect(described_class.package_outdated?("example-tool", source: "https://example.com/tool?rev=next"))
+        .to be(true)
+    end
+
+    it "compares annotated tags using their peeled commit" do
+      stub_cargo_list("example-tool v1.0.0 (https://example.com/tool?tag=v1#12345678):\n")
+      allow(described_class).to receive(:command_output)
+        .with("git", args: ["ls-remote", "--exit-code", "https://example.com/tool", "refs/tags/v1",
+                            "refs/tags/v1^{}"])
+        .and_return("abcdef1234567890\trefs/tags/v1\n1234567890abcdef\trefs/tags/v1^{}\n")
+      expect(described_class.package_outdated?("example-tool", source: "https://example.com/tool?tag=v1"))
+        .to be(false)
+    end
+
+    it "checks the default branch when no reference was specified" do
+      stub_cargo_list("example-tool v1.0.0 (https://example.com/tool#12345678):\n")
+      allow(described_class).to receive(:command_output)
+        .with("git", args: ["ls-remote", "--exit-code", "https://example.com/tool", "HEAD"])
+        .and_return("abcdef1234567890\tHEAD\n")
+      expect(described_class.package_outdated?("example-tool", source: "https://example.com/tool")).to be(true)
+    end
+
+    it "does not update a pinned Git revision" do
+      expect(described_class).not_to receive(:command_output)
+      described_class.package_outdated?("example-tool", source: "https://example.com/tool?rev=12345678")
+    end
+  end
+
+  describe "upgrades" do
+    it_behaves_like "an upgradable extension", "example-tool"
+
+    it "upgrades an installed package using the package manager" do
+      allow(described_class).to receive_messages(package_manager_executable: Pathname("cargo"),
+                                                 package_installed?: true, packages: [], installed_packages: [])
+      expect(Homebrew::Bundle).to receive(:system).with("cargo", "install", "--locked", "example-tool",
+                                                        verbose: false).and_return(true)
+      described_class.install!("example-tool")
+    end
   end
 
   describe "entries" do
@@ -85,6 +213,10 @@ RSpec.describe Homebrew::Bundle::Cargo do
 
   describe "checking" do
     subject(:checker) { described_class.new }
+
+    before do
+      allow(described_class).to receive(:package_outdated?).and_return(false)
+    end
 
     describe "#installed_and_up_to_date?" do
       it "passes the source through when checking a crate installed from a source" do
@@ -235,6 +367,10 @@ RSpec.describe Homebrew::Bundle::Cargo do
   end
 
   describe "installing" do
+    before do
+      allow(described_class).to receive(:package_outdated?).and_return(false)
+    end
+
     context "when Cargo is not installed" do
       before do
         described_class.reset!
