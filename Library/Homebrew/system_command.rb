@@ -416,6 +416,16 @@ class SystemCommand
     end
 
     askpass_flags = ENV.key?("SUDO_ASKPASS") ? ["-A"] : []
+    # Graphical askpass helpers need the display variables that `bin/brew` filters out.
+    # Only `sudo` gets them: they are unset again for the command it runs.
+    askpass_env = if askpass_flags.empty?
+      {}
+    else
+      %w[WAYLAND_DISPLAY XAUTHORITY XDG_RUNTIME_DIR].filter_map do |name|
+        value = ENV.fetch("HOMEBREW_#{name}", nil)
+        [name, value] if value.present?
+      end.to_h
+    end
     user_flags = []
     if Homebrew::EnvConfig.sudo_through_sudo_user?
       if homebrew_sudo_user.blank?
@@ -428,7 +438,9 @@ class SystemCommand
                      "--", "/usr/bin/sudo"]
     end
     user_flags += ["-u", "root"] if sudo_as_root?
-    ["/usr/bin/sudo", *user_flags, *askpass_flags, "-E", *env_args, "--"]
+    [*(["/usr/bin/env", *askpass_env.map { |name, value| "#{name}=#{value}" }] if askpass_env.any?),
+     "/usr/bin/sudo", *user_flags, *askpass_flags, "-E", *env_args, "--",
+     *(["/usr/bin/env", *askpass_env.keys.flat_map { |name| ["-u", name] }] if askpass_env.any?)]
   end
 
   sig { returns(T::Array[String]) }

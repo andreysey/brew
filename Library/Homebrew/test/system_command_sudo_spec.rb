@@ -50,6 +50,20 @@ RSpec.describe SystemCommand do
     expect(described_class.new("true", sudo: true).command).to eq(["/usr/bin/sudo", "-E", "--", "true"])
   end
 
+  it "passes display variables to a graphical askpass helper" do
+    ENV.delete("HOMEBREW_NO_SUDO")
+    ENV["SUDO_ASKPASS"] = "/usr/bin/ksshaskpass"
+    ENV["HOMEBREW_WAYLAND_DISPLAY"] = "wayland-1"
+    ENV.delete("HOMEBREW_XAUTHORITY")
+    ENV["HOMEBREW_XDG_RUNTIME_DIR"] = "/run/user/1000"
+
+    expect(described_class.new("true", sudo: true).command).to eq(
+      ["/usr/bin/env", "WAYLAND_DISPLAY=wayland-1", "XDG_RUNTIME_DIR=/run/user/1000",
+       "/usr/bin/sudo", "-A", "-E", "--",
+       "/usr/bin/env", "-u", "WAYLAND_DISPLAY", "-u", "XDG_RUNTIME_DIR", "true"],
+    )
+  end
+
   it "tries optional elevation without sudo first" do
     ENV.delete("HOMEBREW_NO_SUDO")
 
